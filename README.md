@@ -141,7 +141,7 @@ Books still must be linked (manually or automatically) to send updates to Hardco
 
 ### Enable wifi on demand
 
-On some devices, wifi can be enabled on demand without interruption. When this feature is enabled, wifi will be enabled
+On some devices (e.g. Kobo, PocketBook), wifi can be enabled on demand without interruption. When this feature is enabled, wifi will be enabled
 automatically before some types of background API requests (namely updating the initial application cache, and updating
 your reading progress), and then disabled afterward.
 

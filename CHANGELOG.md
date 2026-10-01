@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+* "Enable wifi on demand" is now available on devices that can toggle wifi directly but not restore it in the
+  background (e.g. PocketBook), so progress syncs no longer depend on wifi already being on
+* Reading progress is no longer discarded on suspend, power off or when closing a book. It is sent right away if
+  connected, otherwise kept and sent on the next start, resume or network connection
+* Fix the close-document handler never running because it listened for the wrong event name
+
 ## 0.4.0 (2026-04-26)
 
 ### Added

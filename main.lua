@@ -147,6 +147,7 @@ function HardcoverApp:init()
     settings = self.settings,
     state = self.state,
     ui = self.ui,
+    wifi = self.wifi,
   }
 
   self:onDispatcherRegisterActions()
@@ -277,12 +278,7 @@ function HardcoverApp:_handlePageUpdate(filename, mapped_page, immediate, callba
     return
   end
 
-  if self.state.book_status.status_id ~= HARDCOVER.STATUS.READING then
-    return
-  end
-
-  local reads = self.state.book_status.user_book_reads
-  local current_read = reads and reads[#reads]
+  local current_read = self:_currentRead()
   if not current_read then
     return
   end
@@ -292,6 +288,12 @@ function HardcoverApp:_handlePageUpdate(filename, mapped_page, immediate, callba
       local result = Api:updatePage(current_read.id, current_read.edition_id, mapped_page, current_read.started_at)
       if result then
         self.state.book_status = result
+
+        -- newer progress for the same read supersedes anything still queued
+        local pending = self.settings:readSetting(SETTING.PENDING_PROGRESS)
+        if pending and pending.read_id == current_read.id then
+          self.settings:updateSetting(SETTING.PENDING_PROGRESS, nil)
+        end
       end
       if callback then
         callback(result)
@@ -307,6 +309,105 @@ function HardcoverApp:_handlePageUpdate(filename, mapped_page, immediate, callba
     immediate_update()
   else
     UIManager:scheduleIn(1, trapped_update)
+  end
+end
+
+function HardcoverApp:_currentRead()
+  if self.state.book_status.status_id ~= HARDCOVER.STATUS.READING then
+    return
+  end
+
+  local reads = self.state.book_status.user_book_reads
+  return reads and reads[#reads]
+end
+
+-- Stores the current position so it survives suspend, power off and closing the book. Scheduled page updates
+-- are cancelled at those moments, and wifi is usually off on devices that only enable it on startup.
+function HardcoverApp:queueProgress()
+  if not (self.ui.document and self:syncFileUpdates(self.ui.document.file)) then
+    return
+  end
+
+  local current_read = self:_currentRead()
+  if not current_read then
+    return
+  end
+
+  local mapped_page = self.page_mapper:getMappedPage(
+    self.state.page,
+    self.ui.document:getPageCount(),
+    self.settings:pages()
+  )
+
+  self.settings:updateSetting(SETTING.PENDING_PROGRESS, {
+    read_id = current_read.id,
+    edition_id = current_read.edition_id,
+    page = mapped_page,
+    started_at = current_read.started_at,
+  })
+end
+
+-- Sends queued progress. Returns true when nothing is left in the queue.
+function HardcoverApp:_sendPendingProgress()
+  local pending = self.settings:readSetting(SETTING.PENDING_PROGRESS)
+  if not pending then
+    return true
+  end
+
+  -- NetworkConnected can arrive twice when two connectivity checks run, don't send the same entry in parallel
+  if self.sending_pending_progress then
+    return false
+  end
+
+  self.sending_pending_progress = true
+  local ok, result = pcall(Api.updatePage, Api, pending.read_id, pending.edition_id, pending.page, pending.started_at)
+  self.sending_pending_progress = false
+
+  if not ok then
+    logger.warn("Hardcover: sending queued progress failed", result)
+    result = nil
+  end
+
+  if not result then
+    logger.info("Hardcover: queued progress not sent, keeping it")
+    return false
+  end
+
+  logger.info("Hardcover: queued progress sent, page", pending.page)
+  self.settings:updateSetting(SETTING.PENDING_PROGRESS, nil)
+  return true
+end
+
+-- Sends queued progress once a connection is available, enabling wifi if allowed
+function HardcoverApp:flushPendingProgress()
+  if not self.settings:readSetting(SETTING.PENDING_PROGRESS) then
+    return
+  end
+
+  Trapper:wrap(function()
+    self.wifi:withWifi(function()
+      self:_sendPendingProgress()
+    end)
+  end)
+end
+
+-- Optionally queues the current position, then sends the queue if a connection is up. Used on suspend and close,
+-- when scheduled updates won't run anymore. Doesn't try to enable wifi: after suspend PocketBook's keylock aborts
+-- any connection attempt. Anything left is sent on the next start, resume or connection.
+function HardcoverApp:syncOrQueueProgress(queue_current)
+  if queue_current then
+    self:queueProgress()
+  end
+
+  if not self.settings:readSetting(SETTING.PENDING_PROGRESS) then
+    return
+  end
+
+  if NetworkManager:isConnected() then
+    -- runs in-process and blocks on purpose: the device may sleep before a subprocess finishes
+    self:_sendPendingProgress()
+  else
+    logger.info("Hardcover: no connection, progress queued for later")
   end
 end
 
@@ -378,6 +479,8 @@ function HardcoverApp:onReaderReady()
   self:registerHighlight()
   self.state.page = self.ui:getCurrentPage()
 
+  UIManager:scheduleIn(1, self.flushPendingProgress, self)
+
   if self.ui.document and (self.settings:syncEnabled() or (not self.settings:bookLinked() and self.settings:autolinkEnabled())) then
     UIManager:scheduleIn(2, self.startReadCache, self)
   end
@@ -395,9 +498,11 @@ function HardcoverApp:cancelPendingUpdates()
   self.page_update_pending = false
 end
 
-function HardcoverApp:onDocumentClose()
-  UIManager:unschedule(self.startCacheRead)
+function HardcoverApp:onCloseDocument()
+  UIManager:unschedule(self.startReadCache)
+  UIManager:unschedule(self.flushPendingProgress)
 
+  local update_pending = self.page_update_pending
   self:cancelPendingUpdates()
   self.state.read_cache_started = false
 
@@ -405,24 +510,30 @@ function HardcoverApp:onDocumentClose()
     return
   end
 
-  if self.page_update_pending then
-    self:updatePageNow()
-  end
+  self:syncOrQueueProgress(update_pending)
 
-  self.process_page_turns = false
+  self.state.process_page_turns = false
   self.page_update_pending = false
   self.state.book_status = {}
   self.state.page_map = nil
 end
 
 function HardcoverApp:onSuspend()
+  UIManager:unschedule(self.flushPendingProgress)
+
+  local update_pending = self.page_update_pending
   self:cancelPendingUpdates()
 
   Scheduler:clear()
   self.state.read_cache_started = false
+
+  -- power off also passes through here, so this is the last chance to save progress
+  self:syncOrQueueProgress(update_pending)
 end
 
 function HardcoverApp:onResume()
+  UIManager:scheduleIn(1, self.flushPendingProgress, self)
+
   if self.settings:readSetting(SETTING.ENABLE_WIFI) and self.ui.document and self.settings:syncEnabled() then
     UIManager:scheduleIn(2, self.startReadCache, self)
   end
@@ -437,8 +548,14 @@ function HardcoverApp:updatePageNow(callback)
   self:_handlePageUpdate(self.ui.document.file, mapped_page, true, callback)
 end
 
+function HardcoverApp:onNetworkDisconnected()
+  self.wifi:onDisconnect()
+end
+
 function HardcoverApp:onNetworkDisconnecting()
   --logger.warn("HARDCOVER on disconnecting")
+  self.wifi:onDisconnect()
+
   if self.settings:readSetting(SETTING.ENABLE_WIFI) then
     return
   end
@@ -455,6 +572,11 @@ function HardcoverApp:onNetworkDisconnecting()
 end
 
 function HardcoverApp:onNetworkConnected()
+  -- when we enabled wifi ourselves, the pending callback sends the queue before disabling wifi again
+  if not self.wifi.connection_pending then
+    self:flushPendingProgress()
+  end
+
   if self.ui.document and self.settings:syncEnabled() and not self.state.read_cache_started then
     --logger.warn("HARDCOVER on connected", self.state.read_cache_started)
 

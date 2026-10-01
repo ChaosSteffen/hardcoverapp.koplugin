@@ -655,7 +655,7 @@ function HardcoverMenu:getSettingsSubMenuItems()
         return self.settings:readSetting(SETTING.ENABLE_WIFI) == true
       end,
       enabled_func = function()
-        return Device:hasWifiRestore()
+        return self.wifi:canEnableWifi()
       end,
       callback = function()
         local setting = self.settings:readSetting(SETTING.ENABLE_WIFI) == true
